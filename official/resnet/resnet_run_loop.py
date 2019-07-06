@@ -28,6 +28,7 @@ import math
 import multiprocessing
 import os
 
+
 # pylint: disable=g-bad-import-order
 from absl import flags
 import tensorflow as tf
@@ -53,7 +54,8 @@ def process_record_dataset(dataset,
                            num_epochs=1,
                            dtype=tf.float32,
                            datasets_num_private_threads=None,
-                           num_parallel_batches=1):
+                           drop_remainder=False,
+                           tf_data_experimental_slack=False):
   """Given a Dataset with raw records, return an iterator over the records.
 
   Args:
@@ -69,7 +71,10 @@ def process_record_dataset(dataset,
     dtype: Data type to use for images/features.
     datasets_num_private_threads: Number of threads for a private
       threadpool created for all datasets computation.
-    num_parallel_batches: Number of parallel batches for tf.data.
+    drop_remainder: A boolean indicates whether to drop the remainder of the
+      batches. If True, the batch dimension will be static.
+    tf_data_experimental_slack: Whether to enable tf.data's
+      `experimental_slack` option.
 
   Returns:
     Dataset of (image, label) pairs ready for iteration.
@@ -83,6 +88,11 @@ def process_record_dataset(dataset,
     tf.compat.v1.logging.info('datasets_num_private_threads: %s',
                               datasets_num_private_threads)
 
+  # Disable intra-op parallelism to optimize for throughput instead of latency.
+  options = tf.data.Options()
+  options.experimental_threading.max_intra_op_parallelism = 1
+  dataset = dataset.with_options(options)
+
   # Prefetches a batch at a time to smooth out the time taken to load input
   # files for shuffling and processing.
   dataset = dataset.prefetch(buffer_size=batch_size)
@@ -94,12 +104,10 @@ def process_record_dataset(dataset,
   dataset = dataset.repeat(num_epochs)
 
   # Parses the raw records into images and labels.
-  dataset = dataset.apply(
-      tf.data.experimental.map_and_batch(
-          lambda value: parse_record_fn(value, is_training, dtype),
-          batch_size=batch_size,
-          num_parallel_batches=num_parallel_batches,
-          drop_remainder=False))
+  dataset = dataset.map(
+      lambda value: parse_record_fn(value, is_training, dtype),
+      num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
 
   # Operations between the final prefetch and the get_next call to the iterator
   # will happen synchronously during run time. We prefetch here again to
@@ -108,6 +116,11 @@ def process_record_dataset(dataset,
   # allows DistributionStrategies to adjust how many batches to fetch based
   # on how many devices are present.
   dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+  if tf_data_experimental_slack:
+    options = tf.data.Options()
+    options.experimental_slack = True
+    dataset = dataset.with_options(options)
 
   return dataset
 
@@ -266,6 +279,56 @@ def learning_rate_with_decay(
                      false_fn=lambda: lr)
     return lr
 
+  def poly_rate_fn(global_step):
+    """Handles linear scaling rule, gradual warmup, and LR decay.
+
+    The learning rate starts at 0, then it increases linearly per step.  After
+    FLAGS.poly_warmup_epochs, we reach the base learning rate (scaled to account
+    for batch size). The learning rate is then decayed using a polynomial rate
+    decay schedule with power 2.0.
+
+    Args:
+      global_step: the current global_step
+
+    Returns:
+      returns the current learning rate
+    """
+
+    # Learning rate schedule for LARS polynomial schedule
+    if flags.FLAGS.batch_size < 8192:
+      plr = 5.0
+      w_epochs = 5
+    elif flags.FLAGS.batch_size < 16384:
+      plr = 10.0
+      w_epochs = 5
+    elif flags.FLAGS.batch_size < 32768:
+      plr = 25.0
+      w_epochs = 5
+    else:
+      plr = 32.0
+      w_epochs = 14
+
+    w_steps = int(w_epochs * batches_per_epoch)
+    wrate = (plr * tf.cast(global_step, tf.float32) / tf.cast(
+        w_steps, tf.float32))
+
+    # TODO(pkanwar): use a flag to help calc num_epochs.
+    num_epochs = 90
+    train_steps = batches_per_epoch * num_epochs
+
+    min_step = tf.constant(1, dtype=tf.int64)
+    decay_steps = tf.maximum(min_step, tf.subtract(global_step, w_steps))
+    poly_rate = tf.train.polynomial_decay(
+        plr,
+        decay_steps,
+        train_steps - w_steps + 1,
+        power=2.0)
+    return tf.where(global_step <= w_steps, wrate, poly_rate)
+
+  # For LARS we have a new learning rate schedule
+  if flags.FLAGS.enable_lars:
+    return poly_rate_fn
+
   return learning_rate_fn
 
 
@@ -273,7 +336,7 @@ def resnet_model_fn(features, labels, mode, model_class,
                     resnet_size, weight_decay, learning_rate_fn, momentum,
                     data_format, resnet_version, loss_scale,
                     loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE,
-                    fine_tune=False):
+                    fine_tune=False, label_smoothing=0.0):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -307,6 +370,7 @@ def resnet_model_fn(features, labels, mode, model_class,
       from the loss.
     dtype: the TensorFlow dtype to use for calculations.
     fine_tune: If True only train the dense layers(final layers).
+    label_smoothing: If greater than 0 then smooth the labels.
 
   Returns:
     EstimatorSpec parameterized according to the input params and the
@@ -343,8 +407,14 @@ def resnet_model_fn(features, labels, mode, model_class,
         })
 
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
-  cross_entropy = tf.compat.v1.losses.sparse_softmax_cross_entropy(
-      logits=logits, labels=labels)
+  if label_smoothing != 0.0:
+    one_hot_labels = tf.one_hot(labels, 1001)
+    cross_entropy = tf.losses.softmax_cross_entropy(
+        logits=logits, onehot_labels=one_hot_labels,
+        label_smoothing=label_smoothing)
+  else:
+    cross_entropy = tf.compat.v1.losses.sparse_softmax_cross_entropy(
+        logits=logits, labels=labels)
 
   # Create a tensor named cross_entropy for logging purposes.
   tf.identity(cross_entropy, name='cross_entropy')
@@ -356,16 +426,14 @@ def resnet_model_fn(features, labels, mode, model_class,
     return 'batch_normalization' not in name
   loss_filter_fn = loss_filter_fn or exclude_batch_norm
 
-  # Add weight decay to the loss. We need to scale the regularization loss
-  # manually as losses other than in tf.losses and tf.keras.losses don't scale
-  # automatically.
+  # Add weight decay to the loss.
   l2_loss = weight_decay * tf.add_n(
       # loss is computed using fp32 for numerical stability.
       [
           tf.nn.l2_loss(tf.cast(v, tf.float32))
           for v in tf.compat.v1.trainable_variables()
           if loss_filter_fn(v.name)
-      ]) / tf.distribute.get_strategy().num_replicas_in_sync
+      ])
   tf.compat.v1.summary.scalar('l2_loss', l2_loss)
   loss = cross_entropy + l2_loss
 
@@ -378,10 +446,23 @@ def resnet_model_fn(features, labels, mode, model_class,
     tf.identity(learning_rate, name='learning_rate')
     tf.compat.v1.summary.scalar('learning_rate', learning_rate)
 
-    optimizer = tf.compat.v1.train.MomentumOptimizer(
-        learning_rate=learning_rate,
-        momentum=momentum
-    )
+    if flags.FLAGS.enable_lars:
+      optimizer = tf.contrib.opt.LARSOptimizer(
+          learning_rate,
+          momentum=momentum,
+          weight_decay=weight_decay,
+          skip_list=['batch_normalization', 'bias'])
+    else:
+      optimizer = tf.compat.v1.train.MomentumOptimizer(
+          learning_rate=learning_rate,
+          momentum=momentum
+      )
+
+    fp16_implementation = getattr(flags.FLAGS, 'fp16_implementation', None)
+    if fp16_implementation == 'graph_rewrite':
+      optimizer = (
+          tf.compat.v1.train.experimental.enable_mixed_precision_graph_rewrite(
+              optimizer, loss_scale=loss_scale))
 
     def _dense_grad_filter(gvs):
       """Only apply gradient updates to the final layer.
@@ -395,7 +476,7 @@ def resnet_model_fn(features, labels, mode, model_class,
       """
       return [(g, v) for g, v in gvs if 'dense' in v.name]
 
-    if loss_scale != 1:
+    if loss_scale != 1 and fp16_implementation != 'graph_rewrite':
       # When computing fp16 gradients, often intermediate tensor values are
       # so small, they underflow to 0. To avoid this, we multiply the loss by
       # loss_scale to make these tensor values loss_scale times bigger.
@@ -458,7 +539,9 @@ def resnet_main(
       This is only used if flags_obj.export_dir is passed.
 
   Returns:
-    Dict of results of the run.
+     Dict of results of the run.  Contains the keys `eval_results` and
+    `train_hooks`. `eval_results` contains accuracy (top_1) and accuracy_top_5.
+    `train_hooks` is a list the instances of hooks used during training.
   """
 
   model_helpers.apply_clean(flags.FLAGS)
@@ -482,14 +565,16 @@ def resnet_main(
       distribution_strategy=flags_obj.distribution_strategy,
       num_gpus=flags_core.get_num_gpus(flags_obj),
       num_workers=num_workers,
-      all_reduce_alg=flags_obj.all_reduce_alg)
+      all_reduce_alg=flags_obj.all_reduce_alg,
+      num_packs=flags_obj.num_packs)
 
   # Creates a `RunConfig` that checkpoints every 24 hours which essentially
   # results in checkpoints determined only by `epochs_between_evals`.
   run_config = tf.estimator.RunConfig(
       train_distribute=distribution_strategy,
       session_config=session_config,
-      save_checkpoints_secs=60*60*24)
+      save_checkpoints_secs=60*60*24,
+      save_checkpoints_steps=None)
 
   # Initializes model with all but the dense layer from pretrained ResNet.
   if flags_obj.pretrained_model_checkpoint_path is not None:
@@ -506,9 +591,11 @@ def resnet_main(
           'data_format': flags_obj.data_format,
           'batch_size': flags_obj.batch_size,
           'resnet_version': int(flags_obj.resnet_version),
-          'loss_scale': flags_core.get_loss_scale(flags_obj),
+          'loss_scale': flags_core.get_loss_scale(flags_obj,
+                                                  default_for_fp16=128),
           'dtype': flags_core.get_tf_dtype(flags_obj),
-          'fine_tune': flags_obj.fine_tune
+          'fine_tune': flags_obj.fine_tune,
+          'num_workers': num_workers,
       })
 
   run_params = {
@@ -518,6 +605,7 @@ def resnet_main(
       'resnet_version': flags_obj.resnet_version,
       'synthetic_data': flags_obj.use_synthetic_data,
       'train_epochs': flags_obj.train_epochs,
+      'num_workers': num_workers,
   }
   if flags_obj.use_synthetic_data:
     dataset_name = dataset_name + '-synthetic'
@@ -531,22 +619,22 @@ def resnet_main(
       model_dir=flags_obj.model_dir,
       batch_size=flags_obj.batch_size)
 
-  def input_fn_train(num_epochs):
+  def input_fn_train(num_epochs, input_context=None):
     return input_function(
         is_training=True,
         data_dir=flags_obj.data_dir,
-        batch_size=distribution_utils.per_device_batch_size(
+        batch_size=distribution_utils.per_replica_batch_size(
             flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
         num_epochs=num_epochs,
         dtype=flags_core.get_tf_dtype(flags_obj),
         datasets_num_private_threads=flags_obj.datasets_num_private_threads,
-        num_parallel_batches=flags_obj.datasets_num_parallel_batches)
+        input_context=input_context)
 
   def input_fn_eval():
     return input_function(
         is_training=False,
         data_dir=flags_obj.data_dir,
-        batch_size=distribution_utils.per_device_batch_size(
+        batch_size=distribution_utils.per_replica_batch_size(
             flags_obj.batch_size, flags_core.get_num_gpus(flags_obj)),
         num_epochs=1,
         dtype=flags_core.get_tf_dtype(flags_obj))
@@ -554,18 +642,19 @@ def resnet_main(
   train_epochs = (0 if flags_obj.eval_only or not flags_obj.train_epochs else
                   flags_obj.train_epochs)
 
-  use_train_and_evaluate = flags_obj.use_train_and_evaluate or (
-      distribution_strategy.__class__.__name__ == 'CollectiveAllReduceStrategy')
+  use_train_and_evaluate = flags_obj.use_train_and_evaluate or num_workers > 1
   if use_train_and_evaluate:
     train_spec = tf.estimator.TrainSpec(
-        input_fn=lambda: input_fn_train(train_epochs), hooks=train_hooks,
+        input_fn=lambda input_context=None: input_fn_train(
+            train_epochs, input_context=input_context),
+        hooks=train_hooks,
         max_steps=flags_obj.max_train_steps)
-    eval_spec = tf.estimator.EvalSpec(input_fn=input_fn_eval,
-                                      steps=flags_obj.max_train_steps)
+    eval_spec = tf.estimator.EvalSpec(input_fn=input_fn_eval)
     tf.compat.v1.logging.info('Starting to train and evaluate.')
-    eval_results, _ = tf.estimator.train_and_evaluate(classifier, train_spec,
-                                                      eval_spec)
-    benchmark_logger.log_evaluation_result(eval_results)
+    tf.estimator.train_and_evaluate(classifier, train_spec, eval_spec)
+    # tf.estimator.train_and_evalute doesn't return anything in multi-worker
+    # case.
+    eval_results = {}
   else:
     if train_epochs == 0:
       # If --eval_only is set, perform a single loop with zero train epochs.
@@ -592,8 +681,11 @@ def resnet_main(
         # value of num_train_epochs in the lambda function will not be changed
         # before it is used. So it is safe to ignore the pylint error here
         # pylint: disable=cell-var-from-loop
-        classifier.train(input_fn=lambda: input_fn_train(num_train_epochs),
-                         hooks=train_hooks, max_steps=flags_obj.max_train_steps)
+        classifier.train(
+            input_fn=lambda input_context=None: input_fn_train(
+                num_train_epochs, input_context=input_context),
+            hooks=train_hooks,
+            max_steps=flags_obj.max_train_steps)
 
       # flags_obj.max_train_steps is generally associated with testing and
       # profiling. As a result it is frequently called with synthetic data,
@@ -630,13 +722,17 @@ def resnet_main(
   return stats
 
 
-def define_resnet_flags(resnet_size_choices=None):
+def define_resnet_flags(resnet_size_choices=None, dynamic_loss_scale=False,
+                        fp16_implementation=False):
   """Add flags and validators for ResNet."""
   flags_core.define_base()
   flags_core.define_performance(num_parallel_calls=False,
                                 tf_gpu_thread_mode=True,
                                 datasets_num_private_threads=True,
-                                datasets_num_parallel_batches=True)
+                                dynamic_loss_scale=dynamic_loss_scale,
+                                fp16_implementation=fp16_implementation,
+                                loss_scale=True,
+                                tf_data_experimental_slack=True)
   flags_core.define_image()
   flags_core.define_benchmark()
   flags.adopt_module_key_flags(flags_core)
@@ -684,6 +780,19 @@ def define_resnet_flags(resnet_size_choices=None):
       name='task_index', default=-1,
       help=flags_core.help_wrap('If multi-worker training, the task_index of '
                                 'this worker.'))
+  flags.DEFINE_bool(
+      name='enable_lars', default=False,
+      help=flags_core.help_wrap(
+          'Enable LARS optimizer for large batch training.'))
+  flags.DEFINE_float(
+      name='label_smoothing', default=0.0,
+      help=flags_core.help_wrap(
+          'Label smoothing parameter used in the softmax_cross_entropy'))
+  flags.DEFINE_float(
+      name='weight_decay', default=1e-4,
+      help=flags_core.help_wrap(
+          'Weight decay coefficiant for l2 regularization.'))
+
   choice_kwargs = dict(
       name='resnet_size', short_name='rs', default='50',
       help=flags_core.help_wrap('The size of the ResNet model to use.'))
